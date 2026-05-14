@@ -1,4 +1,4 @@
-# transform-models
+# distrib-nvfp4
 
 Distributed NVFP4 quantization pipeline for 100B+ class LLMs on a 2-node NVIDIA DGX Spark (GB10) cluster.
 
