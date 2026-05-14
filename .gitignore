@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local Claude Code state
+.claude/
+.claude.json
+
+# Run artifacts that don't belong in the repo
+*.log
+/tmp_outputs/
+/checkpoints/
+
+# Pipeline-specific temp dirs (these live on the cluster, never committed)
+_distrib_quant*/
+_ckpt_shard*/
