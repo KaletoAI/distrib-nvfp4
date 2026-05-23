@@ -17,8 +17,15 @@ This pipeline shards the model across two Sparks via Ray, calibrates with hidden
 - **2× NVIDIA DGX Spark** (GB10 Grace+Blackwell, 128 GB unified memory each)
 - **ConnectX-7 IB** between nodes (44 GB/s NCCL measured)
 - **NFS cross-mount**: BF16 source on one node's NVMe, NVFP4 output on the other's
+- **Optional 3rd node** (e.g. RTX 3090 in a Proxmox VM over plain 2.5 GbE LAN) for N-shard mode used on 111B–123B class models — see `--shard-layers a,b,c` and the Phase 6.5 gather
 
-The driver itself is architecture-agnostic — it works for any HuggingFace model whose decoder layers expose a `RMSNorm`-style `input_layernorm` and a `RotaryEmbedding`-style positional encoding. Tested with Llama-3-derived (Anubis-Pro-105B) and Mistral-Large-derived (Behemoth-X-123B) bases. Qwen/Gemma/Cohere/Nemotron-NAS architectures may need small adapters.
+The driver itself is architecture-agnostic — it works for any HuggingFace model whose decoder layers expose an `input_layernorm` (RMSNorm- or LayerNorm-style) and a rotary positional encoding. Tested with:
+
+- **Llama-3-derived**: Anubis-Pro-105B, DeepSeek-R1-Distill-Llama-70B, Llama-3.3-70B-Instruct
+- **Mistral-Large-derived**: Behemoth-X-123B-v2.2
+- **Cohere2 / Command-A**: Fallen-Command-A-111B — in-tree handling for tied embeddings (no separate `lm_head.weight` in the checkpoint), `layer_norm_eps` attribute name, and dropping `generation_config.cache_implementation=hybrid` for the per-layer export template
+
+Qwen / Gemma / Nemotron-NAS untested.
 
 ## Quick start
 
@@ -72,10 +79,11 @@ scripts/run_quant.sh \
 
 ## Pipeline architecture
 
-Driver runs on the head node, orchestrates two Ray actors:
+Driver runs on the head node, orchestrates N Ray actors (2 by default, or N≥3 via `--shard-layers a,b,c`):
 
-- **shard0**: `embed_tokens` + layers `[0:split]`
-- **shard1**: layers `[split:N]` + `norm` + `lm_head`
+- **shard0**: `embed_tokens` + layers `[0:split[0]]`
+- **shard[1..N-2]** (N-shard mode only): middle layer slices, no embed/head
+- **shard[N-1]**: trailing layers + `norm` + `lm_head` — automatically placed on the smallest-VRAM node (e.g. an RTX 3090 takes the tail when paired with two Sparks)
 
 Phases:
 
@@ -94,15 +102,18 @@ For more on Phase 5.5 / 6 and the export-side fixes that make vLLM actually serv
 
 ## Known production targets
 
-| Model | Status |
-|---|---|
-| TheDrummer/Anubis-Pro-105B-v1 (Llama-3.3-based, 105B, 120 layers) | ✅ produced `Kaleto/Anubis-Pro-105B-NVFP4` |
-| TheDrummer/Behemoth-X-123B-v2.2 (Mistral-Large-based, 88 layers) | 🟡 in validation as of this release |
+| Model | Mode | Result |
+|---|---|---|
+| TheDrummer/Anubis-Pro-105B-v1 (Llama-3.3, 105B, 120 layers) | 2-shard | ✅ [`Kaleto/Anubis-Pro-105B-NVFP4`](https://huggingface.co/Kaleto/Anubis-Pro-105B-NVFP4) |
+| TheDrummer/Behemoth-X-123B-v2.2 (Mistral-Large, 88 layers) | 3-shard (41/41/6) | ✅ [`Kaleto/Behemoth-X-123B-v2.2-NVFP4`](https://huggingface.co/Kaleto/Behemoth-X-123B-v2.2-NVFP4) |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-70B (70B, 80 layers) | 2-shard | ✅ [`Kaleto/DeepSeek-R1-Distill-Llama-70B-NVFP4`](https://huggingface.co/Kaleto/DeepSeek-R1-Distill-Llama-70B-NVFP4) |
+| meta-llama/Llama-3.3-70B-Instruct (70B, 80 layers) | 2-shard | ✅ [`Kaleto/Llama-3.3-70B-Instruct-NVFP4`](https://huggingface.co/Kaleto/Llama-3.3-70B-Instruct-NVFP4) |
+| TheDrummer/Fallen-Command-A-111B-v1.1 (Cohere2 / Command-A, 64 layers) | 3-shard (30/30/4) | ✅ [`Kaleto/Fallen-Command-111B-NVFP4`](https://huggingface.co/Kaleto/Fallen-Command-111B-NVFP4) |
 
 Memory ceilings (per shard):
-- ≤105B on 128 GB UMA — comfortable
-- 105–123B class — memory-tight but works with streaming-load (this pipeline)
-- >130B class — would need further chunking or a third node
+- ≤105B on 128 GB UMA — comfortable in 2-shard mode
+- 105–123B class — memory-tight but works in 2-shard with streaming-load; **3-shard via `--shard-layers a,b,c` is the comfortable path** and was used for Behemoth and Fallen-Command above
+- \>130B class — would need either further chunking or a fourth node
 
 ## Acknowledgments
 
