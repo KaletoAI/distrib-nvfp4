@@ -60,13 +60,15 @@ def parse_args():
     p.add_argument("--temp-base", default="/tmp/_distrib_quant",
                    help="Base temp dir for per-actor exports. MUST be node-local (NOT NFS) to avoid rmtree race conditions.")
     p.add_argument("--split", type=int, default=None,
-                   help="Layer index to split between actors. Default: num_layers // 2.")
+                   help="Legacy 2-shard split point. Default: num_layers // 2. "
+                        "Overridden by --shard-layers if given.")
+    p.add_argument("--shard-layers", default=None,
+                   help="Comma-separated layer counts per shard, e.g. '40,40,8' for "
+                        "3-shard. Must sum to num_hidden_layers. Enables N-shard mode.")
     p.add_argument("--resume-from-checkpoint", default=None,
                    help="Skip Phases 1-5 and run only Phase 6+7 against an existing "
-                        "checkpoint dir base. Expects {BASE}_ckpt_shard0 and {BASE}_ckpt_shard1 "
-                        "to exist (created by a previous Phase-5.5). Saves ~25 min when "
-                        "iterating on Phase-6 bugs. Use the same --temp-base that the prior "
-                        "run used, or pass the base path directly.")
+                        "checkpoint dir base. Expects {BASE}_ckpt_shard0..N to exist "
+                        "(created by a previous Phase-5.5).")
     return p.parse_args()
 
 
@@ -99,6 +101,11 @@ class ModelShard:
         with open(index_path) as f:
             weight_map = json.load(f)["weight_map"]
 
+        # Tied embeddings (e.g. Cohere2): the checkpoint has no lm_head.weight —
+        # the output projection reuses model.embed_tokens.weight.
+        tied_lm_head = "lm_head.weight" not in weight_map
+        self.tied_lm_head = tied_lm_head
+
         # Decide which keys to load
         needed_keys = []
         for key in weight_map:
@@ -113,6 +120,12 @@ class ModelShard:
             elif self.has_head and key.startswith("model.rotary_emb"):
                 # some Llama variants put rotary_emb at model level
                 needed_keys.append(key)
+        # Tied-embedding models: the has_head shard needs embed_tokens.weight to
+        # populate lm_head (it has no lm_head.* keys of its own).
+        if (self.has_head and tied_lm_head
+                and "model.embed_tokens.weight" in weight_map
+                and "model.embed_tokens.weight" not in needed_keys):
+            needed_keys.append("model.embed_tokens.weight")
 
         # Group keys by shard
         by_shard = {}
@@ -137,11 +150,27 @@ class ModelShard:
                 for k in keys:
                     if k in shard_keys:
                         t = sf.get_tensor(k).to(torch.bfloat16)
+                        # Tied-embedding has_head shard: route embed_tokens.weight
+                        # straight into lm_head.weight (no lm_head.* in checkpoint;
+                        # avoids double-storing the embedding on this shard).
+                        if (k == "model.embed_tokens.weight" and self.has_head
+                                and tied_lm_head and not self.has_embed):
+                            target_key = "lm_head.weight"
+                        else:
+                            target_key = k
                         set_module_tensor_to_device(
-                            self.model, k, self.device, value=t,
+                            self.model, target_key, self.device, value=t,
                         )
                         del t
             gc.collect()
+
+        # Tied embeddings, single-shard case (has_embed AND has_head): the load
+        # loop filled embed_tokens.weight; mirror it into lm_head.weight.
+        if self.has_head and tied_lm_head and self.has_embed:
+            ew = self.model.model.embed_tokens.weight
+            set_module_tensor_to_device(
+                self.model, "lm_head.weight", self.device, value=ew.data,
+            )
 
         # Local references
         self.embed_tokens = self.model.model.embed_tokens if self.has_embed else None
@@ -226,6 +255,28 @@ class ModelShard:
             position_embeddings = self.rotary_emb_cuda(hidden, position_ids)
             print(f"[DEBUG {self.name}] cos.shape={list(position_embeddings[0].shape)}", flush=True)
             
+            attn_mask = self._causal_mask(seq_len, hidden.dtype)
+
+            for i in range(self.layer_start, self.layer_end):
+                hidden = self.local_layers[i](
+                    hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attn_mask,
+                )
+
+            return hidden.cpu(), position_ids.cpu()
+
+    def forward_middle(self, hidden_states, position_ids):
+        """Middle actor (N-shard mode): hidden_states -> hidden_states, no norm/lm_head."""
+        with torch.no_grad():
+            hidden = hidden_states.to(self.device)
+            position_ids = position_ids.to(self.device)
+            seq_len = hidden.shape[1]
+
+            if not hasattr(self, '_rotary_initialized'):
+                self.rotary_emb_cuda = self.rotary_emb_cls(self.hf_config).to(self.device)
+                self._rotary_initialized = True
+            position_embeddings = self.rotary_emb_cuda(hidden, position_ids)
             attn_mask = self._causal_mask(seq_len, hidden.dtype)
 
             for i in range(self.layer_start, self.layer_end):
@@ -352,16 +403,13 @@ class ModelShard:
         torch-pickle file, then replace the in-memory reference with nn.Identity()
         so Phase 6 can run with ~95 % of UMA freed.
 
-        Each layer file contains the full module pickle including TensorQuantizer
-        state (amax, scales), so Phase 6 can rebuild the per-layer 1-layer template
-        from disk without re-doing calibration. The same files also serve as a
-        resume checkpoint if Phase 6 crashes — re-running Phase 6 will pick up the
-        per-layer state from disk.
-
-        Drops the calibration wrapper too (frees ~1 GB) — must happen before
-        export anyway, see note in export_shard.
+        Uses cloudpickle as pickle_module — modelopt 0.43's QuantLinear is a
+        dynamically-generated subclass that vanilla pickle can't serialize
+        (fails with `attribute lookup QuantLinear on modelopt.torch.opt.dynamic
+        failed` on some platforms — observed on x86_64 + torch 2.11+cu130 VM).
+        cloudpickle handles dynamic classes by inlining their bytecode.
         """
-        import gc
+        import gc, cloudpickle
         os.makedirs(ckpt_dir, exist_ok=True)
 
         if hasattr(self, "_quant_wrapper"):
@@ -370,26 +418,26 @@ class ModelShard:
         n = 0
         for i in range(self.layer_start, self.layer_end):
             path = f"{ckpt_dir}/layer_{i:04d}.pt"
-            # Move to CPU before pickling to keep the on-disk artifact arch-neutral
-            # (also halves I/O vs. pickling a cuda tensor and forcing a copy).
-            torch.save(self.local_layers[i].cpu(), path)
+            torch.save(self.local_layers[i].cpu(), path, pickle_module=cloudpickle)
             self.local_layers[i] = nn.Identity()
+            # Free the evicted layer's GPU memory immediately. On GB10 UMA the
+            # .cpu() copy doubles the layer in the shared pool; without this the
+            # peak climbs and Ray's memory monitor kills the worker.
+            gc.collect()
+            torch.cuda.empty_cache()
             n += 1
 
-        # Also save embed/norm/lm_head so a resume entry point can complete
-        # Phase 6b without needing Phases 1-5. Each is just a few GB on disk
-        # but reclaims that UMA — important when next Phase actually starts.
         extras_saved = []
         if self.has_embed and self.embed_tokens is not None:
-            torch.save(self.embed_tokens.cpu(), f"{ckpt_dir}/embed_tokens.pt")
+            torch.save(self.embed_tokens.cpu(), f"{ckpt_dir}/embed_tokens.pt", pickle_module=cloudpickle)
             self.embed_tokens = None
             extras_saved.append("embed_tokens")
         if self.has_head and self.norm is not None:
-            torch.save(self.norm.cpu(), f"{ckpt_dir}/norm.pt")
+            torch.save(self.norm.cpu(), f"{ckpt_dir}/norm.pt", pickle_module=cloudpickle)
             self.norm = None
             extras_saved.append("norm")
         if self.has_head and self.lm_head is not None:
-            torch.save(self.lm_head.cpu(), f"{ckpt_dir}/lm_head.pt")
+            torch.save(self.lm_head.cpu(), f"{ckpt_dir}/lm_head.pt", pickle_module=cloudpickle)
             self.lm_head = None
             extras_saved.append("lm_head")
 
@@ -451,6 +499,10 @@ class ModelShard:
         cfg_t.pad_token_id = None
         cfg_t.bos_token_id = None
         cfg_t.eos_token_id = None
+        # use_cache=False so transformers' DynamicCache doesn't try to index
+        # the loaded layer's original layer_idx (e.g. 50) against the 1-slot
+        # cache of our 1-layer template — IndexError otherwise.
+        cfg_t.use_cache = False
 
         n_local = self.layer_end - self.layer_start
         weight_map = {}
@@ -478,6 +530,15 @@ class ModelShard:
                 m_one.model.layers[0] = layer
             else:
                 m_one.model.layers[0] = self.local_layers[orig_i]
+            # Force layer_idx=0 on the loaded layer (it kept its original index
+            # from the full model, e.g. 50, but our 1-layer template only has
+            # slot 0). Required for transformers>=4.50 DynamicCache to not
+            # IndexError even with use_cache=False set on the config.
+            placed = m_one.model.layers[0]
+            if hasattr(placed, "self_attn") and hasattr(placed.self_attn, "layer_idx"):
+                placed.self_attn.layer_idx = 0
+            if hasattr(placed, "layer_idx"):
+                placed.layer_idx = 0
 
             # Tiny dummies (16 KB each, totally negligible)
             de = nn.Embedding(cfg_t.vocab_size, cfg_t.hidden_size).to(self.device, dtype=torch.bfloat16)
@@ -485,7 +546,10 @@ class ModelShard:
                 de.weight.zero_()
             m_one.model.embed_tokens = de
 
-            dn = self.rms_norm_cls(cfg_t.hidden_size, eps=cfg_t.rms_norm_eps).to(self.device, dtype=torch.bfloat16)
+            _norm_eps = getattr(cfg_t, "rms_norm_eps", None)
+            if _norm_eps is None:
+                _norm_eps = getattr(cfg_t, "layer_norm_eps", 1e-5)
+            dn = self.rms_norm_cls(cfg_t.hidden_size, eps=_norm_eps).to(self.device, dtype=torch.bfloat16)
             with torch.no_grad():
                 dn.weight.zero_()
             m_one.model.norm = dn
@@ -499,6 +563,12 @@ class ModelShard:
 
             tmp = f"/tmp/_distrib_quant_{self.name}_l{orig_i:04d}"
             shutil.rmtree(tmp, ignore_errors=True)
+            # Cohere2's generation_config sets cache_implementation=hybrid, which
+            # transformers 4.57 rejects together with the use_cache=False export
+            # template. Drop it — the final model gets its real generation_config
+            # copied from the source in the merge phase.
+            if getattr(m_one, "generation_config", None) is not None:
+                m_one.generation_config.cache_implementation = None
             mte.export_hf_checkpoint(m_one, dtype=torch.bfloat16, export_dir=tmp)
 
             # Read back only model.layers.0.* keys, rename to local_idx
@@ -602,12 +672,23 @@ class ModelShard:
 # ============================================================
 # Driver-side: merge per-actor exports into final HF model dir
 # ============================================================
-def merge_exports(shard0_dir, shard1_dir, final_dir, source_model_path,
-                  num_layers_shard0, num_layers_total):
-    """Merge per-actor exports into a single HF compressed-tensors model dir."""
+def merge_exports(shard_dirs, layer_counts, final_dir, source_model_path,
+                  num_layers_total):
+    """Merge per-actor exports into a single HF compressed-tensors model dir.
+    N-shard generalization:
+      shard_dirs: list of per-shard export directories in order
+      layer_counts: list of layer counts per shard (cumulative sum = num_layers_total)
+      First shard contributes embed_tokens.
+      Last shard contributes model.norm + lm_head.
+      Middle shards just contribute their layers (renamed with cumulative offset).
+    """
     import shutil
     from safetensors import safe_open
     from safetensors.torch import save_file
+
+    assert len(shard_dirs) == len(layer_counts), "shard_dirs and layer_counts must align"
+    assert sum(layer_counts) == num_layers_total, \
+        f"layer_counts sum {sum(layer_counts)} != num_layers_total {num_layers_total}"
 
     os.makedirs(final_dir, exist_ok=True)
 
@@ -620,44 +701,42 @@ def merge_exports(shard0_dir, shard1_dir, final_dir, source_model_path,
                         sd[k] = sf.get_tensor(k)
         return sd
 
-    print("  Loading shard0 safetensors...", flush=True)
-    sd0 = load_dir_sd(shard0_dir)
-    print(f"    shard0: {len(sd0)} keys", flush=True)
-    print("  Loading shard1 safetensors...", flush=True)
-    sd1 = load_dir_sd(shard1_dir)
-    print(f"    shard1: {len(sd1)} keys", flush=True)
-
-    # Merge with proper key renaming.
-    # shard0 owns: embed_tokens + model.layers.0..N-1 (already correct indices)
-    # shard1 owns: model.layers.0..M-1 (need rename to N..N+M-1) + model.norm + lm_head
     merged = {}
+    offset = 0
+    N = len(shard_dirs)
+    for i, (d, n_layers) in enumerate(zip(shard_dirs, layer_counts)):
+        print(f"  Loading shard{i} safetensors from {d}...", flush=True)
+        sd = load_dir_sd(d)
+        print(f"    shard{i}: {len(sd)} keys", flush=True)
 
-    # shard0: drop dummy lm_head.* and dummy model.norm.weight
-    n_skipped_0 = 0
-    for k, v in sd0.items():
-        if k.startswith("lm_head") or k == "model.norm.weight":
-            n_skipped_0 += 1
-            continue
-        merged[k] = v
-    print(f"    shard0: kept {len(sd0) - n_skipped_0} keys, dropped {n_skipped_0} dummies", flush=True)
-
-    # shard1: drop dummy model.embed_tokens.weight, rename layer indices
-    n_skipped_1 = 0
-    n_renamed = 0
-    for k, v in sd1.items():
-        if k == "model.embed_tokens.weight":
-            n_skipped_1 += 1
-            continue
-        if k.startswith("model.layers."):
-            parts = k.split(".")
-            old_idx = int(parts[2])
-            new_idx = old_idx + num_layers_shard0
-            new_k = f"model.layers.{new_idx}." + ".".join(parts[3:])
-            merged[new_k] = v
-            n_renamed += 1
-        else:
-            merged[k] = v
-    print(f"    shard1: kept {len(sd1) - n_skipped_1} keys (renamed {n_renamed} layer keys), dropped {n_skipped_1} dummies", flush=True)
+        is_first, is_last = (i == 0), (i == N - 1)
+        n_skipped, n_renamed = 0, 0
+        for k, v in sd.items():
+            # Embed_tokens: keep only on first shard, drop dummy on others
+            if k == "model.embed_tokens.weight":
+                if not is_first:
+                    n_skipped += 1
+                    continue
+                merged[k] = v
+            # lm_head + model.norm: keep only on last shard, drop dummy on others
+            elif k.startswith("lm_head") or k == "model.norm.weight":
+                if not is_last:
+                    n_skipped += 1
+                    continue
+                merged[k] = v
+            # Layer tensors: rename with cumulative offset
+            elif k.startswith("model.layers."):
+                parts = k.split(".")
+                old_idx = int(parts[2])
+                new_idx = old_idx + offset if not is_first else old_idx
+                new_k = f"model.layers.{new_idx}." + ".".join(parts[3:])
+                merged[new_k] = v
+                if not is_first:
+                    n_renamed += 1
+            else:
+                merged[k] = v
+        print(f"    shard{i}: kept {len(sd) - n_skipped} (renamed {n_renamed}), dropped {n_skipped}", flush=True)
+        offset += n_layers
     print(f"  Merged total: {len(merged)} keys", flush=True)
 
     # Inject input_scale=1.0 for every quantized Linear. modelopt 0.43 omits these
@@ -711,9 +790,9 @@ def merge_exports(shard0_dir, shard1_dir, final_dir, source_model_path,
             json.dump(index, f, indent=2)
         print(f"  Saved model.safetensors.index.json", flush=True)
 
-    # config.json: take shard0's (has quantization_config), restore from source what we
+    # config.json: take first shard's (has quantization_config), restore from source what we
     # shrank for Phase-6 dummies (num_hidden_layers, vocab_size, pad/bos/eos token IDs).
-    with open(f"{shard0_dir}/config.json") as fh:
+    with open(f"{shard_dirs[0]}/config.json") as fh:
         cfg = json.load(fh)
     with open(f"{source_model_path}/config.json") as fh:
         src_cfg = json.load(fh)
@@ -742,9 +821,9 @@ def merge_exports(shard0_dir, shard1_dir, final_dir, source_model_path,
         json.dump(cfg, fh, indent=2)
     print(f"  Saved config.json (num_hidden_layers={num_layers_total}, vocab_size={cfg['vocab_size']}, ignore={cfg.get('quantization_config', {}).get('ignore', [])})", flush=True)
 
-    # Copy aux config files from shard0
+    # Copy aux config files from first shard
     for fn in ("generation_config.json", "hf_quant_config.json"):
-        src = f"{shard0_dir}/{fn}"
+        src = f"{shard_dirs[0]}/{fn}"
         if os.path.exists(src):
             shutil.copy(src, f"{final_dir}/{fn}")
             print(f"  Copied {fn}", flush=True)
@@ -767,23 +846,27 @@ def main():
 
     # Resolve resume-vs-fresh-run parameters early so node setup is shared.
     if args.resume_from_checkpoint:
-        ckpt0 = f"{args.resume_from_checkpoint}_ckpt_shard0"
-        ckpt1 = f"{args.resume_from_checkpoint}_ckpt_shard1"
-        for c in (ckpt0, ckpt1):
-            if not os.path.exists(f"{c}/meta.json"):
-                print(f"FATAL: {c}/meta.json missing — pass the same base path used in the prior --temp-base.", flush=True)
-                sys.exit(1)
-        with open(f"{ckpt0}/meta.json") as f:
-            meta0 = json.load(f)
-        with open(f"{ckpt1}/meta.json") as f:
-            meta1 = json.load(f)
-        source_model = args.source_model or meta0["model_path"]
-        split = meta0["layer_end"]
-        num_layers = meta1["layer_end"]
-        print(f"RESUME mode — ckpt0={ckpt0}, ckpt1={ckpt1}", flush=True)
-        print(f"Source: {source_model} (from {'CLI' if args.source_model else 'meta.json'})", flush=True)
+        # Detect how many shard checkpoints exist
+        ckpt_dirs = []
+        for i in range(10):  # max 10 shards
+            cand = f"{args.resume_from_checkpoint}_ckpt_shard{i}"
+            if os.path.exists(f"{cand}/meta.json"):
+                ckpt_dirs.append(cand)
+            else:
+                break
+        if len(ckpt_dirs) < 2:
+            print(f"FATAL: no checkpoint dirs found at {args.resume_from_checkpoint}_ckpt_shard0..", flush=True)
+            sys.exit(1)
+        metas = []
+        for c in ckpt_dirs:
+            with open(f"{c}/meta.json") as f:
+                metas.append(json.load(f))
+        source_model = args.source_model or metas[0]["model_path"]
+        layer_counts = [m["layer_end"] - m["layer_start"] for m in metas]
+        num_layers = sum(layer_counts)
+        print(f"RESUME mode — {len(ckpt_dirs)} shards, layer_counts={layer_counts}", flush=True)
+        print(f"Source: {source_model}", flush=True)
         print(f"Output: {args.output_dir}", flush=True)
-        print(f"Layers: {num_layers} total, split at {split}", flush=True)
     else:
         if not args.source_model:
             print("FATAL: --source-model is required for normal (non-resume) runs.", flush=True)
@@ -792,76 +875,89 @@ def main():
         print(f"Source: {source_model}", flush=True)
         print(f"Output: {args.output_dir}", flush=True)
 
-        # Determine layer count from model config
         config = AutoConfig.from_pretrained(source_model)
         num_layers = config.num_hidden_layers
-        split = args.split if args.split is not None else (num_layers // 2)
-        print(f"Model: {config.architectures[0]}, hidden_size={config.hidden_size}, layers={num_layers}, split at {split}", flush=True)
 
-    # Identify nodes
-    nodes = [n for n in ray.nodes() if n["Alive"]]
-    if len(nodes) < 2:
-        print(f"FATAL: only {len(nodes)} live nodes, need 2", flush=True)
+        if args.shard_layers:
+            layer_counts = [int(x.strip()) for x in args.shard_layers.split(",")]
+            if sum(layer_counts) != num_layers:
+                print(f"FATAL: --shard-layers sum {sum(layer_counts)} != num_layers {num_layers}", flush=True)
+                sys.exit(1)
+        else:
+            split = args.split if args.split is not None else (num_layers // 2)
+            layer_counts = [split, num_layers - split]
+        print(f"Model: {config.architectures[0]}, hidden_size={config.hidden_size}, layers={num_layers}, shard_layers={layer_counts}", flush=True)
+
+    # Identify nodes — sort by available memory descending so biggest shards
+    # land on nodes with most RAM (e.g. Sparks get the big shards; small eGPU
+    # boxes get the trailing tiny shard with lm_head).
+    N = len(layer_counts)
+    nodes = sorted([n for n in ray.nodes() if n["Alive"]],
+                   key=lambda n: -n["Resources"].get("memory", 0))
+    if len(nodes) < N:
+        print(f"FATAL: only {len(nodes)} live nodes, need {N}", flush=True)
         sys.exit(1)
-    node_ids = [n["NodeID"] for n in nodes]
-    print(f"Using nodes: {[n['NodeManagerAddress'] for n in nodes]}", flush=True)
+    node_ids = [n["NodeID"] for n in nodes[:N]]
+    print(f"Using nodes (memory-sorted desc): {[(n['NodeManagerAddress'], int(n['Resources'].get('memory', 0)/1e9)) for n in nodes[:N]]}", flush=True)
 
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    shard0 = ModelShard.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(node_ids[0], soft=False),
-        name="shard0",
-    ).remote(source_model, 0, split, has_embed=True, has_head=False, name="shard0")
-
-    shard1 = ModelShard.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(node_ids[1], soft=False),
-        name="shard1",
-    ).remote(source_model, split, num_layers, has_embed=False, has_head=True, name="shard1")
+    # Build N shards. First has embed, last has head, middles have neither.
+    shards = []
+    offset = 0
+    for i, n_layers in enumerate(layer_counts):
+        is_first, is_last = (i == 0), (i == N - 1)
+        shard = ModelShard.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_ids[i], soft=False),
+            name=f"shard{i}",
+        ).remote(source_model, offset, offset + n_layers,
+                 has_embed=is_first, has_head=is_last, name=f"shard{i}")
+        shards.append(shard)
+        offset += n_layers
+    # Backwards-compat aliases used elsewhere in main()
+    shard0, shard1 = shards[0], shards[-1]
 
     # --- Resume mode: skip Phases 1-5.5 and go straight to Phase 6 ---
     if args.resume_from_checkpoint:
         print("\n=== Resume setup ===", flush=True)
-        for r in ray.get([
-            shard0.setup_for_resume.remote(ckpt0),
-            shard1.setup_for_resume.remote(ckpt1),
-        ]):
+        for r in ray.get([shards[i].setup_for_resume.remote(ckpt_dirs[i]) for i in range(N)]):
             print(f"  {r}", flush=True)
 
         print("\n=== Phase 6: Per-actor export (resumed from checkpoint) ===", flush=True)
-        shard0_temp = f"{args.temp_base}_shard0"
-        shard1_temp = f"{args.temp_base}_shard1"
+        temp_dirs = [f"{args.temp_base}_shard{i}" for i in range(N)]
         t0 = time.time()
-        for r in ray.get([
-            shard0.export_shard.remote(shard0_temp, ckpt0),
-            shard1.export_shard.remote(shard1_temp, ckpt1),
-        ]):
+        for r in ray.get([shards[i].export_shard.remote(temp_dirs[i], ckpt_dirs[i]) for i in range(N)]):
             print(f"  {r}", flush=True)
         print(f"  Per-actor export done in {(time.time()-t0):.1f}s", flush=True)
 
         # Phase 7: merge
         print(f"\n=== Phase 7: Merge to {args.output_dir} ===", flush=True)
         t0 = time.time()
-        merge_exports(
-            shard0_temp, shard1_temp, args.output_dir, source_model,
-            num_layers_shard0=split, num_layers_total=num_layers,
-        )
+        merge_exports(temp_dirs, layer_counts, args.output_dir, source_model, num_layers)
         print(f"  Merge done in {(time.time()-t0):.1f}s", flush=True)
 
         print(f"\nNVFP4 model written to: {args.output_dir}")
-        print(f"Resume checkpoint dirs still at {ckpt0} and {ckpt1} — delete when satisfied.")
+        print(f"Resume checkpoint dirs at {ckpt_dirs} — delete when satisfied.")
         return
 
     # Phase 1
-    print("\n=== Phase 1: Loading model halves ===", flush=True)
+    print(f"\n=== Phase 1: Loading model into {N} shards ===", flush=True)
     t0 = time.time()
-    for r in ray.get([shard0.load_model.remote(), shard1.load_model.remote()]):
+    for r in ray.get([s.load_model.remote() for s in shards]):
         print(f"  {r}", flush=True)
     print(f"  done in {time.time()-t0:.1f}s", flush=True)
 
     # Phase 2
     print("\n=== Phase 2: Inserting NVFP4 quantizers ===", flush=True)
-    for r in ray.get([shard0.apply_quantization.remote(), shard1.apply_quantization.remote()]):
+    for r in ray.get([s.apply_quantization.remote() for s in shards]):
         print(f"  {r}", flush=True)
+
+    def _forward_chain(input_ids):
+        """Drive a sample through shard0 -> shard{1..N-2}.forward_middle -> shard{N-1}.forward_second"""
+        hidden, pos_ids = ray.get(shards[0].forward_first.remote(input_ids))
+        for s in shards[1:-1]:
+            hidden, pos_ids = ray.get(s.forward_middle.remote(hidden, pos_ids))
+        ray.get(shards[-1].forward_second.remote(hidden, pos_ids))
 
     # Phase 3: smoke test with 1 sample first
     print("\n=== Phase 3a: Smoke test (1 sample) ===", flush=True)
@@ -869,16 +965,18 @@ def main():
     test_text = "The quick brown fox jumps over the lazy dog. " * 50
     inputs = tokenizer(test_text, truncation=True, max_length=args.seq_len, return_tensors="pt")
     t0 = time.time()
-    hidden, pos_ids = ray.get(shard0.forward_first.remote(inputs.input_ids))
-    print(f"  shard0 returned hidden_states shape={list(hidden.shape)}, dtype={hidden.dtype}, took {time.time()-t0:.1f}s", flush=True)
-    t1 = time.time()
-    ray.get(shard1.forward_second.remote(hidden, pos_ids))
-    print(f"  shard1 forward done, took {time.time()-t1:.1f}s", flush=True)
+    _forward_chain(inputs.input_ids)
+    print(f"  smoke forward chain through {N} shards: {time.time()-t0:.1f}s", flush=True)
 
     # Phase 3b: full calibration
     print(f"\n=== Phase 3b: Calibration with {args.calib_size} samples ===", flush=True)
-    ds_args = (args.dataset, args.dataset_config) if args.dataset_config else (args.dataset,)
-    dataset = load_dataset(*ds_args, split="train", streaming=True)
+    if args.dataset.startswith("/") or args.dataset.endswith(".jsonl"):
+        # Local jsonl file — load via the json builder
+        print(f"  loading local jsonl: {args.dataset}", flush=True)
+        dataset = load_dataset("json", data_files=args.dataset, split="train", streaming=True)
+    else:
+        ds_args = (args.dataset, args.dataset_config) if args.dataset_config else (args.dataset,)
+        dataset = load_dataset(*ds_args, split="train", streaming=True)
     t0 = time.time()
     count = 0
     for sample in dataset:
@@ -889,8 +987,7 @@ def main():
             continue
 
         inputs = tokenizer(text, truncation=True, max_length=args.seq_len, return_tensors="pt")
-        hidden, pos_ids = ray.get(shard0.forward_first.remote(inputs.input_ids))
-        ray.get(shard1.forward_second.remote(hidden, pos_ids))
+        _forward_chain(inputs.input_ids)
 
         count += 1
         if count % 10 == 0:
@@ -902,54 +999,61 @@ def main():
 
     # Phase 4
     print("\n=== Phase 4: Finalizing quantization ===", flush=True)
-    for r in ray.get([shard0.finalize.remote(), shard1.finalize.remote()]):
+    for r in ray.get([s.finalize.remote() for s in shards]):
         print(f"  {r}", flush=True)
 
     # Phase 5 (diagnostic, not full export yet)
     print("\n=== Phase 5: Diagnostic - amax stats ===", flush=True)
-    for r in ray.get([shard0.export_status.remote(), shard1.export_status.remote()]):
+    for r in ray.get([s.export_status.remote() for s in shards]):
         print(f"  {r}", flush=True)
 
     # Phase 5.5: evict layers to disk so Phase 6 can stream from disk.
-    # This drops peak Phase-6 memory from O(N_layers * layer_size) down to
-    # O(1 layer + export overhead) — required for 120B+ models that occupy
-    # >90% of a 128 GB UMA pool after load.
     print("\n=== Phase 5.5: Evicting layers to disk for streaming export ===", flush=True)
-    ckpt0 = f"{args.temp_base}_ckpt_shard0"
-    ckpt1 = f"{args.temp_base}_ckpt_shard1"
+    ckpt_dirs = [f"{args.temp_base}_ckpt_shard{i}" for i in range(N)]
     t0 = time.time()
-    for r in ray.get([
-        shard0.save_layers_to_disk.remote(ckpt0),
-        shard1.save_layers_to_disk.remote(ckpt1),
-    ]):
+    for r in ray.get([shards[i].save_layers_to_disk.remote(ckpt_dirs[i]) for i in range(N)]):
         print(f"  {r}", flush=True)
     print(f"  Eviction done in {(time.time()-t0):.1f}s", flush=True)
 
     # Phase 6: per-actor export, streaming layers from the checkpoint dirs.
-    # If Phase 6 crashes mid-way, the checkpoint dirs survive — a future
-    # resume entry could re-run just Phase 6 against them.
     print("\n=== Phase 6: Per-actor export (disk-streaming) ===", flush=True)
-    shard0_temp = f"{args.temp_base}_shard0"
-    shard1_temp = f"{args.temp_base}_shard1"
+    temp_dirs = [f"{args.temp_base}_shard{i}" for i in range(N)]
     t0 = time.time()
-    for r in ray.get([
-        shard0.export_shard.remote(shard0_temp, ckpt0),
-        shard1.export_shard.remote(shard1_temp, ckpt1),
-    ]):
+    for r in ray.get([shards[i].export_shard.remote(temp_dirs[i], ckpt_dirs[i]) for i in range(N)]):
         print(f"  {r}", flush=True)
     print(f"  Per-actor export done in {(time.time()-t0):.1f}s", flush=True)
+
+    # Phase 6.5: pull per-shard exports from remote nodes to driver-local NFS.
+    # Required when a shard actor's /mnt/data is its OWN local disk (e.g. an
+    # eGPU host VM) rather than the same NFS-shared filesystem the driver sees.
+    # No-op for actors on driver or NFS-peer nodes (rsync sees identical state).
+    import subprocess, socket
+    driver_ip = socket.gethostbyname(socket.gethostname())
+    print(f"\n=== Phase 6.5: Gather remote shard exports (driver={driver_ip}) ===", flush=True)
+    for i in range(N):
+        actor_ip = nodes[i]["NodeManagerAddress"]
+        if actor_ip == driver_ip:
+            continue
+        local_files = len(os.listdir(temp_dirs[i])) if os.path.exists(temp_dirs[i]) else 0
+        if local_files >= layer_counts[i]:
+            print(f"  shard{i}@{actor_ip}: already visible locally ({local_files} files), skip", flush=True)
+            continue
+        print(f"  shard{i}@{actor_ip}: rsyncing to driver-local {temp_dirs[i]}/ ...", flush=True)
+        subprocess.run([
+            "rsync", "-a", "-e", "ssh -o StrictHostKeyChecking=no",
+            f"kai@{actor_ip}:{temp_dirs[i]}/",
+            f"{temp_dirs[i]}/",
+        ], check=True)
+        print(f"  shard{i}: {len(os.listdir(temp_dirs[i]))} files after sync", flush=True)
 
     # Phase 7: merge
     print(f"\n=== Phase 7: Merge to {args.output_dir} ===", flush=True)
     t0 = time.time()
-    merge_exports(
-        shard0_temp, shard1_temp, args.output_dir, args.source_model,
-        num_layers_shard0=split, num_layers_total=num_layers,
-    )
+    merge_exports(temp_dirs, layer_counts, args.output_dir, args.source_model, num_layers)
     print(f"  Merge done in {(time.time()-t0):.1f}s", flush=True)
 
     print(f"\nNVFP4 model written to: {args.output_dir}")
-    print(f"Temp dirs can be deleted: rm -rf {args.temp_base}_shard0 {args.temp_base}_shard1 {args.temp_base}_ckpt_shard0 {args.temp_base}_ckpt_shard1")
+    print(f"Temp dirs can be deleted: rm -rf {args.temp_base}_shard* {args.temp_base}_ckpt_shard*")
 
 
 if __name__ == "__main__":
