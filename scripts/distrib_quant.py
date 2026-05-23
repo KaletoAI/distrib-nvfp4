@@ -930,6 +930,29 @@ def main():
             print(f"  {r}", flush=True)
         print(f"  Per-actor export done in {(time.time()-t0):.1f}s", flush=True)
 
+        # Phase 6.5: pull per-shard exports from remote nodes to driver-local NFS.
+        # Same logic as the non-resume path; without this, multi-node resumes
+        # whose actors are not NFS-shared with the driver fail Phase 7 with
+        # FileNotFoundError on temp_dirs[i].
+        import subprocess, socket
+        driver_ip = socket.gethostbyname(socket.gethostname())
+        print(f"\n=== Phase 6.5: Gather remote shard exports (driver={driver_ip}) ===", flush=True)
+        for i in range(N):
+            actor_ip = nodes[i]["NodeManagerAddress"]
+            if actor_ip == driver_ip:
+                continue
+            local_files = len(os.listdir(temp_dirs[i])) if os.path.exists(temp_dirs[i]) else 0
+            if local_files >= layer_counts[i]:
+                print(f"  shard{i}@{actor_ip}: already visible locally ({local_files} files), skip", flush=True)
+                continue
+            print(f"  shard{i}@{actor_ip}: rsyncing to driver-local {temp_dirs[i]}/ ...", flush=True)
+            subprocess.run([
+                "rsync", "-a", "-e", "ssh -o StrictHostKeyChecking=no",
+                f"kai@{actor_ip}:{temp_dirs[i]}/",
+                f"{temp_dirs[i]}/",
+            ], check=True)
+            print(f"  shard{i}: {len(os.listdir(temp_dirs[i]))} files after sync", flush=True)
+
         # Phase 7: merge
         print(f"\n=== Phase 7: Merge to {args.output_dir} ===", flush=True)
         t0 = time.time()
