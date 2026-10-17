@@ -31,3 +31,7 @@ env/
 # Pipeline-specific temp dirs (these live on the cluster, never committed)
 _distrib_quant*/
 _ckpt_shard*/
+
+# superpowers plans/specs/scratch — local only
+docs/superpowers/
+.superpowers/
