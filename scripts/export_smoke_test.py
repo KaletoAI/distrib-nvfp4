@@ -42,6 +42,10 @@ def main():
     cfg_t.pad_token_id = None
     cfg_t.bos_token_id = None
     cfg_t.eos_token_id = None
+    # use_cache=False mirrors the driver's export template — without it,
+    # transformers' DynamicCache indexes the layer's original layer_idx against
+    # the 1-slot cache of the 1-layer template (IndexError in the driver).
+    cfg_t.use_cache = False
     print(f"cfg: arch={cfg_t.architectures[0] if cfg_t.architectures else '?'}, "
           f"vocab={cfg_t.vocab_size}, pad={cfg_t.pad_token_id}, num_layers={cfg_t.num_hidden_layers}")
 
@@ -68,7 +72,12 @@ def main():
         de.weight.zero_()
     m.model.embed_tokens = de
 
-    dn = rms_norm_cls(cfg_t.hidden_size, eps=cfg_t.rms_norm_eps).to(args.device, dtype=torch.bfloat16)
+    # Cohere2/Command-A names the attribute layer_norm_eps, not rms_norm_eps —
+    # same fallback chain as the driver's export template.
+    _norm_eps = getattr(cfg_t, "rms_norm_eps", None)
+    if _norm_eps is None:
+        _norm_eps = getattr(cfg_t, "layer_norm_eps", 1e-5)
+    dn = rms_norm_cls(cfg_t.hidden_size, eps=_norm_eps).to(args.device, dtype=torch.bfloat16)
     with torch.no_grad():
         dn.weight.zero_()
     m.model.norm = dn
@@ -83,12 +92,14 @@ def main():
 
     print("Applying NVFP4 quantization to layer 0...")
     mtq.quantize(m.model.layers[0], mtq.NVFP4_DEFAULT_CFG, forward_loop=None)
+    print("  OK")
     # Mirror the real driver's pre-export setup so this smoke test exercises the same code path:
     #   - finalize amax (so export sees realistic state)
     #   - disable_calib / enable_quant
     # DO NOT set _calibrator = None: modelopt's export uses set_quantizer_by_cfg_context which
     # AttributeErrors on a None calibrator. The driver previously did this and the smoke test
     # missed it because the test wasn't doing the same null-out. Don't reintroduce that gap.
+    print("Mirroring driver pre-export quantizer state...")
     from modelopt.torch.quantization.nn import TensorQuantizer
     for mod in m.model.layers[0].modules():
         if isinstance(mod, TensorQuantizer):
@@ -100,7 +111,36 @@ def main():
                 mod.enable_quant()
     print("  OK")
 
+    # Phase-5.5→6 serialization roundtrip: the driver never exports the
+    # in-memory layer — it torch.saves the quantized layer with cloudpickle
+    # (modelopt's QuantLinear is a dynamically-generated subclass; vanilla
+    # pickle fails on the x86_64 VM node) and reloads it with
+    # weights_only=False before export. A layer that survives quantize but not
+    # this roundtrip crashes Phase 6 after 25 min of calibration, so it must
+    # be exercised here.
+    import cloudpickle
+    print("cloudpickle save/load roundtrip (mirrors Phase 5.5 -> 6)...")
+    ckpt_dir = args.out_dir + "_ckpt"
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_pt = os.path.join(ckpt_dir, "layer_0000.pt")
+    torch.save(m.model.layers[0].cpu(), ckpt_pt, pickle_module=cloudpickle)
+    layer = torch.load(ckpt_pt, map_location=args.device, weights_only=False)
+    layer = layer.to(args.device)
+    m.model.layers[0] = layer
+    # Driver forces layer_idx=0 on the reloaded layer; mirror it.
+    if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+        layer.self_attn.layer_idx = 0
+    if hasattr(layer, "layer_idx"):
+        layer.layer_idx = 0
+    print("  OK")
+
     shutil.rmtree(args.out_dir, ignore_errors=True)
+    # Cohere2's generation_config sets cache_implementation=hybrid, which
+    # transformers 4.57 rejects together with use_cache=False — same drop as
+    # the driver's export template.
+    if getattr(m, "generation_config", None) is not None:
+        m.generation_config.cache_implementation = None
     print(f"Calling export_hf_checkpoint -> {args.out_dir}...")
     try:
         mte.export_hf_checkpoint(m, dtype=torch.bfloat16, export_dir=args.out_dir)
