@@ -25,14 +25,17 @@ The driver itself is architecture-agnostic — it works for any HuggingFace mode
 - **Mistral-Large-derived**: Behemoth-X-123B-v2.2
 - **Cohere2 / Command-A**: Fallen-Command-A-111B — in-tree handling for tied embeddings (no separate `lm_head.weight` in the checkpoint), `layer_norm_eps` attribute name, and dropping `generation_config.cache_implementation=hybrid` for the per-layer export template
 
-Qwen / Gemma / Nemotron-NAS untested.
+- **Qwen3.5 / Qwen3.6 MoE** (`qwen3_5_moe`, hybrid Gated-DeltaNet + full attention, 256 experts, VL checkpoint): the text stack is loaded from the nested `text_config` and the `model.language_model.*` keys are mapped onto it; experts + shared expert go to NVFP4, all token-mixer projections, routers and `shared_expert_gate` stay BF16; vision tower and MTP head are copied verbatim in BF16. Needs transformers ≥ 5 (tested with 5.8.0).
+
+Gemma / Nemotron-NAS untested.
 
 ## Quick start
 
 Requirements on both nodes:
 - `modelopt` 0.43.0+ (NVIDIA TensorRT-Model-Optimizer)
 - `ray` 2.55.1
-- `transformers` 4.57.6
+- `transformers` 4.57.6 for Llama / Mistral / Cohere2; ≥ 5.x (tested 5.8.0) for Qwen3.5/3.6 MoE
+- `datasets` (calibration data, streamed)
 - `safetensors`, `accelerate`, `torch` 2.11+
 - All from the same Python environment, mirrored on both nodes (rsync is fine)
 
@@ -77,6 +80,42 @@ scripts/run_quant.sh \
     --output-dir /path/to/<MODEL>-NVFP4
 ```
 
+Useful flags:
+- `--shard-layers 40,40,8` — N-shard split (`'40'` = single shard)
+- `--gpus-per-actor 0.5` — stack several shards on one node (e.g. a 35B test run with two shards on a single Spark)
+- `--moe-calib-ratio 1.0` — MoE: fraction of experts every calibration token is routed to while collecting stats
+- `--disable-quant '*self_attn*'` — extra modules to keep in BF16 (repeatable)
+- `--dataset abisee/cnn_dailymail` / `--dataset /path/to/calib.jsonl` — rows with `article`, `text` or chat `messages`
+- `--ssh-user` — user for the Phase-6.5 rsync from remote shard nodes
+
+## Output format: W4A16 by default (`--act-format`)
+
+The exported NVFP4 weights can be declared to vLLM in two ways:
+
+| `--act-format` | config | vLLM path on GB10 (v0.31) | Qwen3.6-35B-A3B: top-K KLD vs BF16 | prefill / decode |
+|---|---|---|---|---|
+| `w4a16` (default) | `quant_algo: W4A16_NVFP4` (same ignore list) | Marlin FP4 GEMM, BF16 activations | **0.076** (median 0.0065) | 5969 tok/s / 38.7 tok/s |
+| `w4a4` | plain `NVFP4` + ignore list | FlashInfer-Cutlass FP4 GEMM, activations quantized to FP4 at runtime | 0.110 (median 0.0122) | 6562 tok/s / 37.9 tok/s |
+
+Dense models gain as much: Qwen3.5-9B-heretic-v2 measured 0.179 (W4A4) → **0.129** (W4A16), median 0.028 → 0.015. On a dense 111B (Fallen-Command) decode stays the same (3.3 tok/s), but prefill drops 654 → 228 tok/s, because every GEMM — not just the experts — goes through Marlin.
+
+Same safetensors in both cases — only `quant_algo` in `config.json` / `hf_quant_config.json` differs (a per-module `MIXED_PRECISION` declaration measured the same: 0.076). NVIDIA's own release `nvidia/Qwen3.6-35B-A3B-NVFP4` (bit-identical expert weights, plus FP8 attention) uses W4A16 for the MLP and measured 0.100. In the W4A4 path the activation's global scale barely matters: calibrated `input_scale`, `input_scale = 1.0` and NVIDIA's scales all measured within noise (0.109–0.110) — the per-16-element FP4 rounding of activations dominates.
+
+Measurement: 72 held-out sequences (news, wiki EN/DE, code, chat, RP chats, app prompts; 276k positions), `kld_eval.py` top-50 KLD with union + rest bucket, everything served by the vLLM 0.31 container.
+
+## Sequential mode (`--sequential`)
+
+Instead of holding whole layer slices in memory, the sequential mode walks the model one decoder layer at a time: load layer *i* in BF16 → insert quantizers → push every calibration sample through it (stats collection on) → export it → its outputs become the inputs of layer *i+1*. Peak memory per node is roughly one layer plus the calibration hidden states (128 × 1024 tokens × 3072 hidden ≈ 0.8 GB), so model size is no longer bounded by cluster memory — a 122B-class model runs on a single Spark.
+
+With several workers (`--seq-workers`, default one per live GPU node) the **calibration samples** are split, not the layers: every worker runs the same layer on its share of the samples and keeps its hidden states node-local; the driver max-merges the per-quantizer amax (exact for max calibration) and rank 0 exports. Two Sparks therefore roughly halve the calibration time, and the result does not depend on the worker count. Every worker node needs the BF16 source under the same path (NFS mount or copy). Use one worker per GPU: two worker processes time-sharing one GPU were ~4× slower in a test (hundreds of tiny MoE expert kernels per layer, context switches between processes); one worker on one Spark calibrates as fast as the distributed mode (Qwen3.6-35B-A3B, 128 × ~720 tokens: ~53 s per layer).
+
+The run is resumable: after each layer every worker persists its hidden states (`{temp_base}_seq_w{rank}/state.pt`) and rank 0 has the layer's export in `{temp_base}_seq_export/`. Restarting the same command (same model, samples, worker count, quant options) continues after the last completed layer; `--fresh` forces a restart.
+
+```bash
+python3 distrib_quant.py --sequential --source-model /models/Qwen3.5-122B-A10B \
+    --output-dir /models/Qwen3.5-122B-A10B-NVFP4 --calib-size 256 --seq-len 2048
+```
+
 ## Pipeline architecture
 
 Driver runs on the head node, orchestrates N Ray actors (2 by default, or N≥3 via `--shard-layers a,b,c`):
@@ -90,13 +129,14 @@ Phases:
 | # | What |
 |---|---|
 | 1 | Build empty HF model on each actor (`init_empty_weights`), materialize only owned layers via streaming `safetensors.safe_open` (per-tensor, never caches a whole shard — required for ≥120 GB models on 128 GB UMA). |
-| 2 | Wrap own layers in a `LocalQuantizable(nn.Module)`, call `mtq.quantize(wrapper, NVFP4_DEFAULT_CFG, forward_loop=None)`. `forward_loop=None` is critical — it inserts quantizers in calibration mode without modelopt running its own forward. |
-| 3 | Driver-orchestrated calibration: shard0.forward_first → returns hidden states over Ray → shard1.forward_second. 128-256 samples × variable length from `cnn_dailymail` by default. |
-| 4 | `load_calib_amax` + `disable_calib` + `enable_quant` on every TensorQuantizer per actor. |
-| 5 | Diagnostic — print amax stats. Target: `nan=0 zero=0`. |
-| 5.5 | **Evict layers to disk** — each actor `torch.save`s its quantized layers to a checkpoint dir, replaces in-memory refs with `nn.Identity()`. Drops UMA usage from ~95 % back to ~5 %. Files double as a resume checkpoint. |
-| 6 | Per-layer streaming export — load layer from checkpoint dir, run `mte.export_hf_checkpoint`, save the per-layer NVFP4 safetensors, discard. Peak memory: ~1 layer + ~10 GB export overhead, regardless of model size. |
-| 7 | Driver-side merge — collect per-actor files, rename shard1 layer indices, patch config.json (restore vocab_size, token IDs, set `input_activations.dynamic=true`), inject `input_scale=1.0` for every quantized Linear (modelopt 0.43 omits these; vLLM needs them present), copy tokenizer, write sharded `model-NNNNN-of-NNNNN.safetensors`. |
+| 2 | Wrap own layers in a `LocalQuantizable(nn.Module)`, call `mtq.quantize(wrapper, cfg, forward_loop=None)` (NVFP4 + per-architecture BF16 patterns), then **re-open stats collection** with `enable_stats_collection`. `forward_loop=None` alone runs modelopt's weight-only calibration and closes collection again, so without the re-open no activation statistics are ever gathered. MoE blocks get `_moe_calib_experts_ratio` (`--moe-calib-ratio`, default 1.0 = every expert sees every calibration token). |
+| 3 | Driver-orchestrated calibration: shard0 embeds + runs its layers → hidden states over Ray → next shard … Linear-attention layers get no causal mask. Aborts if the dataset yields fewer than `--calib-size` samples. |
+| 4 | `finish_stats_collection` (+ MoE amax sync) — fails if any active quantizer ended up without amax. |
+| 5 | Diagnostic — weight / input amax stats. Target: `zero=0 nan=0 none=0`. |
+| 5.5 | **Evict layers to disk** — each actor `torch.save`s its quantized layers (cloudpickle) to a fresh checkpoint dir and replaces every in-memory reference (layers, embed, norm, lm_head) with `nn.Identity()`. Drops UMA usage from ~95 % back to ~5 %. Files double as a resume checkpoint; `meta.json` records shard index / count so a resume can verify completeness. |
+| 6 | Per-layer streaming export — load layer from checkpoint dir, run `mte.export_hf_checkpoint` inside a 1-layer template, save the layer's tensors under their global index. Peak memory: ~1 layer + export overhead, regardless of model size. |
+| 6.5 | Gather — `rsync -a --delete` of every remote shard's export dir to the driver. |
+| 7 | Driver-side merge — verify every layer / file is present exactly once, rename to the source layout (e.g. `model.language_model.*`), copy non-text source tensors (vision, MTP) verbatim, write `config.json` = source config + `quantization_config` with an ignore list derived from the final tensors, copy generation config / tokenizer / chat template / processor files from the source. Loads the whole quantized model into driver RAM (≈ output size). |
 
 For more on Phase 5.5 / 6 and the export-side fixes that make vLLM actually serve the output, see `docs/debugging-notes.md`.
 
@@ -109,6 +149,8 @@ For more on Phase 5.5 / 6 and the export-side fixes that make vLLM actually serv
 | deepseek-ai/DeepSeek-R1-Distill-Llama-70B (70B, 80 layers) | 2-shard | ✅ [`Kaleto/DeepSeek-R1-Distill-Llama-70B-NVFP4`](https://huggingface.co/Kaleto/DeepSeek-R1-Distill-Llama-70B-NVFP4) |
 | meta-llama/Llama-3.3-70B-Instruct (70B, 80 layers) | 2-shard | ✅ [`Kaleto/Llama-3.3-70B-Instruct-NVFP4`](https://huggingface.co/Kaleto/Llama-3.3-70B-Instruct-NVFP4) |
 | TheDrummer/Fallen-Command-A-111B-v1.1 (Cohere2 / Command-A, 64 layers) | 3-shard (30/30/4) | ✅ [`Kaleto/Fallen-Command-111B-NVFP4`](https://huggingface.co/Kaleto/Fallen-Command-111B-NVFP4) |
+
+Note: the releases above were produced with v0.1, whose Phase 3 did not actually collect activation statistics (see Phase 2 above). Their NVFP4 weights are calibrated; their activation global scales are the `input_scale = 1.0` placeholder with `input_activations.dynamic = true`. Runs with the current code export calibrated `input_scale` values instead.
 
 Memory ceilings (per shard):
 - ≤105B on 128 GB UMA — comfortable in 2-shard mode

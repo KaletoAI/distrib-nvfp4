@@ -75,6 +75,8 @@ The actual safetensors are correct — only the config is wrong.
 
 **Fix in `merge_exports`:** read `source_model/config.json`, restore `vocab_size`, `pad_token_id`, `bos_token_id`, `eos_token_id`, `architectures` from there, write into the merged config.
 
+> **Update (calibration fix):** the root cause of Fixes 5 and 6 was in this pipeline, not in modelopt. `mtq.quantize(..., forward_loop=None)` runs modelopt's weight-only `max_calibrate`, which ends with `finish_stats_collection()` — calibration off. Phase 3 therefore never collected activation amax, and modelopt only emits `input_scale` for input quantizers that have one. The pipeline now calls `enable_stats_collection()` after quantize and `finish_stats_collection()` in Phase 4, so every quantized Linear gets a real `input_scale` and `dynamic` stays as modelopt writes it. Fixes 5 and 6 remain in `merge_exports` only as a fallback for resuming pre-fix checkpoints (no `input_scale` anywhere); a partial set is a hard error.
+
 ### Fix 5: `input_activations.dynamic: false` is a lie
 
 modelopt 0.43's NVFP4 export writes `quantization_config.config_groups.group_0.input_activations.dynamic = false` into `hf_quant_config.json` and `config.json`. This tells vLLM "I have pre-computed static input scales for the activations, please use them at inference time".
@@ -122,6 +124,10 @@ If you don't have an `input_scale` key in your safetensors, the `Parameter` stay
 
 For a 120-layer Llama with 7 quantized Linears per layer that's 840 keys, ~84 KB total. Tiny.
 
+## W4A4 vs. W4A16 on Spark (measured)
+
+vLLM 0.31 on GB10 runs a plain `NVFP4` checkpoint as **W4A4** (`FlashInferCutlassNvFp4LinearKernel`, MoE backend `FLASHINFER_CUTLASS`): activations are quantized to FP4 at runtime. Declaring the same weights `quant_algo: W4A16_NVFP4` (or per module via `MIXED_PRECISION`) switches to Marlin with BF16 activations (`MarlinNvFp4LinearKernel`, MoE backend `MARLIN`). On Qwen3.6-35B-A3B that cut the top-K KLD vs BF16 from 0.110 to 0.076 at unchanged decode speed (prefill −9 %). Dense check (Qwen3.5-9B-heretic-v2, same eval set): 0.179 → 0.129. Dense cost: on Fallen-Command-111B prefill fell 654 → 228 tok/s (decode unchanged 3.3 tok/s), since all GEMMs run through Marlin; for MoE only −9 %. The pipeline therefore writes W4A16 by default (`--act-format`). Existing W4A4 releases can be converted without re-quantization — only the config changes; the Kaleto HF repos carry such a config in branch `w4a16` (2026-11-15).
+
 ## Identifying the right "fast path" on Spark
 
 A separate gotcha worth flagging: many NVFP4 quantization writeups (including older versions of this README) point at `FlashInferCutlassNvFp4LinearKernel` in the vLLM startup log as the marker for "you're on the NVFP4 fast path". This is misleading on DGX Spark / GB10.
@@ -144,7 +150,7 @@ For a Llama/Mistral-class model split across 2 nodes, expect these per-shard UMA
 | 2-4 (quantize/calibrate/finalize) | ~123 GB | quantizer wrappers add <1 GB |
 | 5.5 (eviction) | drops to ~5 GB | every layer goes to disk as `torch.save(layer.cpu())`, in-memory ref becomes `nn.Identity` |
 | 6 (export) | ~13 GB | one layer loaded from disk + ~10 GB export overhead per iter |
-| 7 (merge, on driver) | <10 GB | driver-side, not on actors |
+| 7 (merge, on driver) | ≈ output size | driver-side; the whole quantized model is held in driver RAM while sharding (actors have evicted by then) |
 
 Phase 1 is the tightest — if your model's per-shard size exceeds ~119 GB (the usable UMA on a 128 GB Spark after kernel/OS), you'll hit OOM even with streaming load. Above that ceiling you'd need a 3-way split or a different sharding strategy.
 

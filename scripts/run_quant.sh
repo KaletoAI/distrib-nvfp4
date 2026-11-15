@@ -16,7 +16,7 @@ PYTHON=${PYTHON:-python3}
 DRIVER=${DRIVER:-"$SCRIPT_DIR/distrib_quant.py"}
 LOG=${LOG:-/tmp/distrib_quant.log}
 
-echo "=== run started: $(date -Iseconds) on $(hostname) ===" > "$LOG"
+echo "=== run started: $(date -Iseconds) on $(hostname) ===" >> "$LOG"
 echo "python: $PYTHON" | tee -a "$LOG"
 echo "driver: $DRIVER" | tee -a "$LOG"
 echo "args:   $*"      | tee -a "$LOG"
