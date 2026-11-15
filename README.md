@@ -116,6 +116,12 @@ python3 distrib_quant.py --sequential --source-model /models/Qwen3.5-122B-A10B \
     --output-dir /models/Qwen3.5-122B-A10B-NVFP4 --calib-size 256 --seq-len 2048
 ```
 
+### Per-layer and per-expert error (`--layer-stats`)
+
+A mean KLD over the whole model can hide single bad layers or experts. With `--layer-stats` the sequential mode measures, for every layer before it is exported, the quantization error on that layer's BF16 inputs (so errors of earlier layers do not accumulate): the whole layer (residual removed), attention and MLP in isolation, the MoE shared expert, and every routed expert together with the number of tokens routed to it. The error is the relative L2 distance to the same layer unquantized, using exactly the quantizers active at serve time (`--act-format w4a16`: weights only). One log line per layer; at the end a summary lists layers above 1.5× and experts above 2× the median, and everything goes to `<output-dir>/layer_stats.json`. Cost: one extra BF16 and one quantized forward of `--layer-stats-samples` (default 32) samples per layer, about 15 s per layer on Qwen3.6-35B-A3B. The exported model is bit-identical with and without it.
+
+Qwen3.6-35B-A3B, W4A16, 64 mixed samples (news, wiki EN/DE, code, chat), all 10,240 experts routed: whole layer 0.030–0.110 (median 0.085), no layer above 1.5× median; experts median 0.141, worst 0.178 (1.27×), none above 2×, and the worst experts are not the rarely routed ones. With weight-only FP4 and a scale per 16 weights the error is nearly uniform; activation quantization (W4A4) is where calibration-dependent outliers would be expected.
+
 ## Pipeline architecture
 
 Driver runs on the head node, orchestrates N Ray actors (2 by default, or N≥3 via `--shard-layers a,b,c`):

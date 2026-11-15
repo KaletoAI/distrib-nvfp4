@@ -23,10 +23,12 @@ See --help for all options.
 """
 
 import argparse
+import collections
 import copy
 import gc
 import getpass
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -124,6 +126,15 @@ def parse_args():
                         "With --gpus-per-actor < 1 several workers can share a node.")
     p.add_argument("--fresh", action="store_true",
                    help="Sequential mode: ignore resumable state from an earlier run.")
+    p.add_argument("--layer-stats", action="store_true",
+                   help="Sequential mode: after each layer, measure its quantization error on "
+                        "BF16 inputs (no accumulation from earlier layers) — whole layer, "
+                        "attention and MLP in isolation, and every MoE expert with its token "
+                        "count. Error = relative L2 vs. the same layer unquantized, using the "
+                        "quantizers active at serve time (--act-format). Written to "
+                        "<output-dir>/layer_stats.json; outliers are listed at the end.")
+    p.add_argument("--layer-stats-samples", type=int, default=32,
+                   help="Calibration samples (of worker 0) used for --layer-stats.")
     p.add_argument("--resume-from-checkpoint", default=None,
                    help="Skip Phases 1-5 and run only Phase 6+7 against an existing "
                         "checkpoint dir base. Expects {BASE}_ckpt_shard0..N-1 to exist on "
@@ -331,6 +342,55 @@ def amax_stats(wrapper):
                 samples.append((name, round(amax.flatten()[0].item(), 4)))
     fmt = lambda s: f"good={s[0]} zero={s[1]} nan={s[2]} none={s[3]}"
     return f"weight[{fmt(stats['weight'])}] input[{fmt(stats['input'])}] samples={samples}"
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None and x == x)
+    return xs[len(xs) // 2] if xs else float("nan")
+
+
+def format_layer_stats(st):
+    """One log line for --layer-stats of one layer."""
+    parts = [f"{k} {st[k]:.4f}" for k in ("layer", "attn", "mlp", "shared") if k in st]
+    parts.append(f"tok p99 {st['token_err_p99']:.3f} max {st['token_err_max']:.2f}")
+    ex = [(v[0], int(e), v[1]) for e, v in st.get("experts", {}).items() if v[0] is not None]
+    if ex:
+        worst = max(ex)
+        unrouted = sum(1 for v in st["experts"].values() if v[1] == 0)
+        parts.append(f"experts med {_median([x[0] for x in ex]):.4f} worst e{worst[1]} "
+                     f"{worst[0]:.4f} ({worst[2]} tok), unrouted {unrouted}")
+    if st.get("route_mismatch"):
+        parts.append(f"ROUTE MISMATCH {st['route_mismatch']}")
+    return ", ".join(parts)
+
+
+def report_layer_outliers(layer_stats, layer_factor=1.5, expert_factor=2.0, min_tokens=32):
+    """Summary of --layer-stats: per-component median over layers and every layer
+    above layer_factor x median; experts (>= min_tokens routed tokens) above
+    expert_factor x the median of all measured experts."""
+    lines = ["\n=== Layer stats (relative L2 error vs. BF16, per layer on BF16 inputs) ==="]
+    keys = [k for k in ("layer", "attn", "mlp", "shared") if any(k in s for s in layer_stats.values())]
+    for k in keys:
+        vals = {i: s[k] for i, s in layer_stats.items() if k in s}
+        med = _median(vals.values())
+        hi = sorted(((v, i) for i, v in vals.items() if v > layer_factor * med), reverse=True)
+        lines.append(f"  {k:6s} median {med:.4f}, max {max(vals.values()):.4f} (layer "
+                     f"{max(vals, key=vals.get)}); > {layer_factor}x median: "
+                     + (", ".join(f"L{i} {v:.4f}" for v, i in hi[:10]) or "none"))
+    ex = [(v[0], i, int(e), v[1]) for i, s in layer_stats.items()
+          for e, v in s.get("experts", {}).items() if v[0] is not None and v[1] >= min_tokens]
+    if ex:
+        med = _median([x[0] for x in ex])
+        hi = sorted((x for x in ex if x[0] > expert_factor * med), reverse=True)
+        n_unrouted = sum(1 for s in layer_stats.values() for v in s.get("experts", {}).values() if v[1] == 0)
+        n_few = sum(1 for s in layer_stats.values() for v in s.get("experts", {}).values()
+                    if 0 < v[1] < min_tokens)
+        lines.append(f"  experts: {len(ex)} measured (>= {min_tokens} tok), median {med:.4f}, "
+                     f"{len(hi)} above {expert_factor}x median; {n_few} with < {min_tokens} tok, "
+                     f"{n_unrouted} unrouted in the stats samples")
+        for v, i, e, t in hi[:15]:
+            lines.append(f"    L{i} e{e}: {v:.4f} ({v / med:.1f}x, {t} tok)")
+    return "\n".join(lines)
 
 
 AUX_FILES = (
@@ -850,6 +910,165 @@ class SeqWorkerImpl:
         size = sum(t.numel() * t.element_size() for t in layer_sd.values())
         return {"export_s": time.time() - t0, "bytes": size, "stats": stats}
 
+    def layer_stats(self, i, merged_amax, act_format, n_samples):
+        """Quantization error of layer i on its BF16 inputs. Call BEFORE export_layer
+        (the export packs the weights to FP4 in place); applies the same merged amax
+        and MoE amax sync as the export. Reference: every quantizer disabled.
+        Candidate: the quantizers active at serve time (w4a16: weight quantizers only).
+        Reported as relative L2 error sqrt(sum|q - ref|^2 / sum|ref|^2):
+          layer   whole layer, residual removed (|out_q - out_ref| / |out_ref - h|);
+                  includes routing changes caused by the quantized attention
+          attn    attention block alone, on the reference inputs
+          mlp     MLP block alone, on the reference inputs (same routing)
+          shared  MoE shared expert alone
+          experts per routed expert: [rel err, tokens routed to it]"""
+        from modelopt.torch.quantization.nn import TensorQuantizer
+        pi, m_one, wrapper, _ = self._pending
+        assert pi == i
+        t0 = time.time()
+        for n, m in wrapper.named_modules():
+            if isinstance(m, TensorQuantizer) and n in merged_amax:
+                m.amax = merged_amax[n].to(self.device)
+        sync_moe_and_check(wrapper, f"{self.name} layer {i} (stats)")
+        layer = wrapper.layers[0]
+        lt = self.layer_types[i] if self.layer_types else None
+        qs = [(n, m) for n, m in wrapper.named_modules() if isinstance(m, TensorQuantizer)]
+        orig = {n: m.is_enabled for n, m in qs}
+        serve = {n: orig[n] and (act_format == "w4a4" or n.endswith("weight_quantizer")) for n, _ in qs}
+
+        # Fake-quantize every served weight once and swap it in, instead of letting
+        # modelopt re-quantize all expert weights on every forward.
+        wq = {}
+        with torch.no_grad():
+            for n, m in qs:
+                if not (serve[n] and n.endswith("weight_quantizer")):
+                    continue
+                parent = wrapper.get_submodule(n.rsplit(".", 1)[0])
+                w = getattr(parent, "weight", None)
+                if isinstance(w, torch.Tensor) and w.device.type != "meta":
+                    m.enable()
+                    wq[n] = (parent, w.data, m(w).detach())
+
+        def set_quant(on):
+            for n, m in qs:
+                if n in wq:
+                    parent, w_bf16, w_q = wq[n]
+                    parent.weight.data = w_q if on else w_bf16
+                    m.disable()
+                else:
+                    m.enable() if (on and serve[n]) else m.disable()
+
+        attn = getattr(layer, "self_attn", None) or getattr(layer, "linear_attn", None)
+        attn_quantized = attn is not None and any(
+            serve[n] for n, _ in qs if ".self_attn." in n or ".linear_attn." in n)
+        mlp = getattr(layer, "mlp", None)
+        shared = getattr(mlp, "shared_expert", None) if mlp is not None else None
+        experts = {}
+        for n, m in layer.named_modules():
+            parts = n.split(".")
+            if len(parts) == 4 and parts[:2] == ["mlp", "experts"] and parts[3] == "down_proj":
+                experts[int(parts[2])] = m
+
+        cap = {}
+        mode = {"tag": None}
+        hooks = []
+
+        def first(o):
+            return o[0] if isinstance(o, tuple) else o
+
+        def out_hook(name):
+            def h(mod, args, out):
+                if mode["tag"] is not None:
+                    cap[(mode["tag"], name)] = first(out).detach()
+            return h
+        if attn is not None:
+            hooks.append(attn.register_forward_pre_hook(
+                lambda mod, a, kw: cap.__setitem__("attn_in", (a, kw)) if mode["tag"] == "ref" else None,
+                with_kwargs=True))
+            hooks.append(attn.register_forward_hook(out_hook("attn")))
+        if mlp is not None:
+            hooks.append(mlp.register_forward_pre_hook(
+                lambda mod, a: cap.__setitem__("mlp_in", a) if mode["tag"] == "ref" else None))
+            hooks.append(mlp.register_forward_hook(out_hook("mlp")))
+        if shared is not None:
+            hooks.append(shared.register_forward_hook(out_hook("shared")))
+        for e, m in experts.items():
+            hooks.append(m.register_forward_hook(out_hook(("expert", e))))
+
+        acc = collections.defaultdict(lambda: [0.0, 0.0, 0])
+        tok_err = []
+        route_mismatch = 0
+
+        def add(key, q, ref, base=None):
+            q, ref = q.float(), ref.float()
+            a = acc[key]
+            a[0] += (q - ref).pow(2).sum().item()
+            a[1] += (ref if base is None else ref - base.float()).pow(2).sum().item()
+            a[2] += q.shape[-2] if q.dim() >= 2 else 1
+
+        rotary = getattr(m_one.model, "rotary_emb", None)
+        try:
+            with torch.no_grad():
+                for h in self.hidden[:n_samples]:
+                    T = h.shape[1]
+                    pos = torch.arange(T, device=self.device).unsqueeze(0)
+                    pe = rotary(h, pos) if rotary is not None else None
+                    mask = None if lt == "linear_attention" else causal_mask(T, h.dtype, self.device)
+                    cap.clear()
+                    set_quant(False)
+                    mode["tag"] = "ref"
+                    out_ref = first(layer(h, position_embeddings=pe, attention_mask=mask))
+                    set_quant(True)
+                    mode["tag"] = None
+                    out_q = first(layer(h, position_embeddings=pe, attention_mask=mask))
+                    add("layer", out_q, out_ref, base=h)
+                    d_ref = (out_ref - h).float().reshape(-1, out_ref.shape[-1])
+                    d_err = (out_q - out_ref).float().reshape(-1, out_ref.shape[-1])
+                    tok_err.append((d_err.norm(dim=-1) / d_ref.norm(dim=-1).clamp_min(1e-6)).cpu())
+                    mode["tag"] = "q"
+                    if attn_quantized and "attn_in" in cap:
+                        a, kw = cap["attn_in"]
+                        attn(*a, **kw)
+                        add("attn", cap[("q", "attn")], cap[("ref", "attn")])
+                    if mlp is not None and "mlp_in" in cap:
+                        mlp(*cap["mlp_in"])
+                        add("mlp", cap[("q", "mlp")], cap[("ref", "mlp")])
+                        if shared is not None:
+                            add("shared", cap[("q", "shared")], cap[("ref", "shared")])
+                        for e in experts:
+                            r, q = cap.get(("ref", ("expert", e))), cap.get(("q", ("expert", e)))
+                            if r is None and q is None:
+                                continue
+                            if r is None or q is None or r.shape != q.shape:
+                                route_mismatch += 1
+                                continue
+                            add(("expert", e), q, r)
+                    mode["tag"] = None
+        finally:
+            for hk in hooks:
+                hk.remove()
+            for n, (parent, w_bf16, _) in wq.items():
+                parent.weight.data = w_bf16
+            for n, m in qs:
+                m.enable() if orig[n] else m.disable()
+            cap.clear()
+            wq.clear()
+
+        def rel(a):
+            return math.sqrt(a[0] / a[1]) if a[1] > 0 else float("nan")
+        te = torch.cat(tok_err) if tok_err else torch.zeros(1)
+        out = {"layer_type": lt, "samples": min(n_samples, len(self.hidden)),
+               "tokens": int(te.numel()), "seconds": round(time.time() - t0, 1),
+               "token_err_p50": float(te.quantile(0.5)), "token_err_p99": float(te.quantile(0.99)),
+               "token_err_max": float(te.max()), "route_mismatch": route_mismatch}
+        for k in ("layer", "attn", "mlp", "shared"):
+            if k in acc:
+                out[k] = rel(acc[k])
+        if experts:
+            out["experts"] = {e: [rel(acc[("expert", e)]), acc[("expert", e)][2]]
+                              if ("expert", e) in acc else [None, 0] for e in sorted(experts)}
+        return out
+
     def commit(self, i):
         pi, m_one, wrapper, new_hidden = self._pending
         assert pi == i
@@ -1208,6 +1427,12 @@ def run_sequential(args):
     for r in ray.get([w.setup.remote(ids[r::W], sample_key, resume_done) for r, w in enumerate(workers)]):
         print(f"  {r}", flush=True)
 
+    stats_path = f"{args.temp_base}_seq_layer_stats.json"
+    layer_stats = {}
+    if args.layer_stats and resume_done >= 0 and os.path.exists(stats_path):
+        with open(stats_path) as f:
+            layer_stats = {int(k): v for k, v in json.load(f).items() if int(k) <= resume_done}
+
     t_start = time.time()
     total_bytes = 0
     for i in range(resume_done + 1, L):
@@ -1217,6 +1442,14 @@ def run_sequential(args):
         for amax, _ in res:
             for n, v in amax.items():
                 merged[n] = v if n not in merged else torch.maximum(merged[n], v)
+        if args.layer_stats:
+            # before the export, which packs the weights to FP4 in place
+            st = ray.get(workers[0].layer_stats.remote(i, merged, args.act_format,
+                                                       args.layer_stats_samples))
+            layer_stats[i] = st
+            with open(stats_path + ".tmp", "w") as f:
+                json.dump(layer_stats, f)
+            os.replace(stats_path + ".tmp", stats_path)
         ex = ray.get(workers[0].export_layer.remote(i, merged))
         mem = ray.get([w.commit.remote(i) for w in workers])
         total_bytes += ex["bytes"]
@@ -1227,6 +1460,8 @@ def run_sequential(args):
               f"(load {max(r[1]['load_s'] for r in res):.0f}s, calib {max(r[1]['calib_s'] for r in res):.0f}s, "
               f"export {ex['export_s']:.0f}s) {ex['bytes'] / 1e9:.2f} GB, mem={max(mem):.1f}G, "
               f"eta {eta / 60:.0f} min", flush=True)
+        if args.layer_stats:
+            print(f"    err {format_layer_stats(layer_stats[i])}", flush=True)
         if i == resume_done + 1 or (i + 1) % 10 == 0 or i == L - 1:
             print(f"    amax: {ex['stats']}", flush=True)
     print(f"  all layers done in {(time.time() - t_start) / 60:.1f} min", flush=True)
@@ -1239,6 +1474,11 @@ def run_sequential(args):
     t0 = time.time()
     merge_exports([export_dir], [L], args.output_dir, source_model, L, act_format=args.act_format)
     print(f"  Merge done in {(time.time() - t0):.1f}s", flush=True)
+    if args.layer_stats:
+        with open(f"{args.output_dir}/layer_stats.json", "w") as f:
+            json.dump({"act_format": args.act_format, "samples": args.layer_stats_samples,
+                       "layers": {str(k): v for k, v in sorted(layer_stats.items())}}, f, indent=1)
+        print(report_layer_outliers(layer_stats), flush=True)
     print(f"\nNVFP4 model written to: {args.output_dir}")
     print(f"Temp dirs can be deleted: rm -rf {args.temp_base}_seq_*  (on every worker node)")
 
